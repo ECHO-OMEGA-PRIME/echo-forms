@@ -1,0 +1,26 @@
+name = "echo-forms"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-forms"
+database_id = "ab24e88b-114c-4d75-a503-c972ae8cd24c"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "d75ab1fce5a74ca2994ba4e910293483"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[triggers]
+crons = ["0 6 * * *"]
