@@ -10,6 +10,8 @@ interface RLState { c: number; t: number }
 
 // TODO: Consider batching sequential D1 queries with db.batch() for performance
 
+// TODO: Consider batching sequential D1 queries with db.batch() for performance
+
 const app = new Hono<{ Bindings: Env }>();
 app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
 
