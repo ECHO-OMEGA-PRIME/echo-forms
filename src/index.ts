@@ -8,6 +8,8 @@ import { cors } from 'hono/cors';
 interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; }
 interface RLState { c: number; t: number }
 
+// TODO: Consider batching sequential D1 queries with db.batch() for performance
+
 const app = new Hono<{ Bindings: Env }>();
 app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
 
