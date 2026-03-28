@@ -1,11 +1,11 @@
 /**
- * Echo Forms v1.0.0 — AI-Powered Form Builder & Survey System
+ * Echo Forms v2.0.0 — AI-Powered Form Builder with Stripe Billing
  * Cloudflare Worker with Hono, D1, KV, service bindings
  */
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
-interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; }
+interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; STRIPE_SECRET_KEY?: string; STRIPE_WEBHOOK_SECRET?: string; ANALYTICS: AnalyticsEngineDataset; }
 interface RLState { c: number; t: number }
 
 // TODO: Consider batching sequential D1 queries with db.batch() for performance
@@ -13,6 +13,26 @@ interface RLState { c: number; t: number }
 // TODO: Consider batching sequential D1 queries with db.batch() for performance
 
 // TODO: Consider batching sequential D1 queries with db.batch() for performance
+
+const FORM_PLANS = [
+  { id: 'free', name: 'Free', forms: 5, responses: 100, price: 0, display: 'Free' },
+  { id: 'pro', name: 'Pro', forms: 50, responses: 10000, price: 1999, display: '$19.99/mo' },
+  { id: 'business', name: 'Business', forms: 500, responses: 100000, price: 4999, display: '$49.99/mo' },
+  { id: 'enterprise', name: 'Enterprise', forms: -1, responses: -1, price: 14999, display: '$149.99/mo' },
+] as const;
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts: Record<string, string> = {};
+  for (const p of sigHeader.split(',')) { const eq = p.indexOf('='); if (eq > 0) parts[p.slice(0, eq).trim()] = p.slice(eq + 1).trim(); }
+  const ts = parts['t'], v1 = parts['v1'];
+  if (!ts || !v1 || Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${ts}.${payload}`));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== v1.length) return false;
+  let diff = 0; for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1.charCodeAt(i);
+  return diff === 0;
+}
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -35,7 +55,7 @@ const tid = (c: any) => c.req.header('X-Tenant-ID') || c.req.query('tenant_id') 
 const json = (d: unknown, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-forms', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-forms', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
@@ -64,7 +84,7 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/public/')) return next();
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/public/') || path === '/webhooks/stripe') return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
@@ -74,8 +94,30 @@ app.use('*', async (c, next) => {
   return next();
 });
 
-app.get('/', (c) => c.json({ service: 'echo-forms', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => json({ status: 'ok', service: 'echo-forms', version: '1.0.0', time: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-forms', version: '2.0.0', status: 'operational', features: ['form-builder', 'templates', 'ai-analysis', 'stripe-billing', 'public-submissions'] }));
+app.get('/health', (c) => json({ status: 'ok', service: 'echo-forms', version: '2.0.0', time: new Date().toISOString(), stripe: !!c.env.STRIPE_SECRET_KEY }));
+
+// ═══════════════ STRIPE WEBHOOK ═══════════════
+app.post('/webhooks/stripe', async (c) => {
+  if (!c.env.STRIPE_WEBHOOK_SECRET) return json({ error: 'Not configured' }, 503);
+  const body = await c.req.text();
+  const sig = c.req.header('Stripe-Signature') || '';
+  if (!(await verifyStripeSignature(body, sig, c.env.STRIPE_WEBHOOK_SECRET))) return json({ error: 'Invalid signature' }, 401);
+  const event = JSON.parse(body);
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const tenantId = session.metadata?.tenant_id;
+    const plan = session.metadata?.plan;
+    if (tenantId && plan) {
+      const planDef = FORM_PLANS.find(p => p.id === plan);
+      if (planDef) {
+        await c.env.DB.prepare('UPDATE tenants SET plan=?, stripe_customer_id=?, plan_expires_at=datetime("now","+30 days") WHERE id=?').bind(plan, session.customer || null, tenantId).run();
+        slog('info', 'Plan upgraded via Stripe', { tenant_id: tenantId, plan });
+      }
+    }
+  }
+  return json({ received: true });
+});
 
 // ═══════════════ TENANTS ═══════════════
 app.post('/tenants', async (c) => {
@@ -86,6 +128,44 @@ app.post('/tenants', async (c) => {
 app.get('/tenants/:id', async (c) => {
   const r = await c.env.DB.prepare('SELECT * FROM tenants WHERE id=?').bind(c.req.param('id')).first();
   return r ? json(r) : json({ error: 'Not found' }, 404);
+});
+
+// ═══════════════ PLANS & BILLING ═══════════════
+app.get('/plans', async (c) => {
+  const t = tid(c);
+  const tenant = await c.env.DB.prepare('SELECT plan, stripe_customer_id, plan_expires_at FROM tenants WHERE id=?').bind(t).first();
+  const currentPlan = FORM_PLANS.find(p => p.id === (tenant?.plan as string || 'free')) || FORM_PLANS[0];
+  return json({ current: tenant?.plan || 'free', limits: { forms: currentPlan.forms, responses: currentPlan.responses }, expires: tenant?.plan_expires_at, plans: FORM_PLANS });
+});
+
+app.post('/plans/upgrade', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+  const b = await c.req.json<{ plan: string; success_url?: string; cancel_url?: string }>().catch(() => null);
+  if (!b?.plan) return json({ error: 'plan required' }, 400);
+  const plan = FORM_PLANS.find(p => p.id === b.plan && p.price > 0);
+  if (!plan) return json({ error: 'Invalid plan', valid: FORM_PLANS.filter(p => p.price > 0).map(p => p.id) }, 400);
+  const t = tid(c);
+  const base = 'https://echo-forms.bmcii1976.workers.dev';
+  const params = new URLSearchParams({
+    'mode': 'subscription',
+    'success_url': b.success_url || `${base}/health?upgraded=true`,
+    'cancel_url': b.cancel_url || `${base}/health`,
+    'line_items[0][price_data][currency]': 'usd',
+    'line_items[0][price_data][product_data][name]': `Echo Forms — ${plan.name} Plan`,
+    'line_items[0][price_data][unit_amount]': String(plan.price),
+    'line_items[0][price_data][recurring][interval]': 'month',
+    'line_items[0][quantity]': '1',
+    'metadata[tenant_id]': t,
+    'metadata[plan]': plan.id,
+  });
+  const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+  const session = await resp.json() as Record<string, unknown>;
+  if (!resp.ok) return json({ error: 'Stripe error', details: session }, 502);
+  return json({ checkout_url: session.url, session_id: session.id, plan: plan.id, price: plan.display });
 });
 
 // ═══════════════ FORMS ═══════════════
@@ -366,11 +446,25 @@ app.get('/activity', async (c) => {
   return json((await c.env.DB.prepare('SELECT * FROM activity_log WHERE tenant_id=? ORDER BY created_at DESC LIMIT 100').bind(tid(c)).all()).results);
 });
 
+// ═══════════════ ADMIN: STRIPE MIGRATION ═══════════════
+app.post('/admin/migrate-stripe', async (c) => {
+  const stmts = [
+    c.env.DB.prepare(`ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT`),
+    c.env.DB.prepare(`ALTER TABLE tenants ADD COLUMN plan_expires_at TEXT`),
+  ];
+  const results = [];
+  for (const s of stmts) {
+    try { await s.run(); results.push('OK'); }
+    catch (e: any) { results.push(e.message?.includes('duplicate') || e.message?.includes('already exists') ? 'SKIP' : `ERR: ${e.message}`); }
+  }
+  return json({ migrated: true, results });
+});
+
 app.onError((err, c) => {
   if (err.message?.includes('JSON')) {
     return c.json({ error: 'Invalid JSON body' }, 400);
   }
-  console.error(`[echo-forms] ${err.message}`);
+  slog('error', 'Unhandled error', { error: err.message });
   return c.json({ error: 'Internal server error' }, 500);
 });
 
