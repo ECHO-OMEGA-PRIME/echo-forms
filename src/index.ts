@@ -189,7 +189,7 @@ app.post('/public/forms/:slug/submit', async (c) => {
   // Trigger webhooks
   const hooks = await c.env.DB.prepare("SELECT * FROM webhooks WHERE form_id=? AND tenant_id=? AND is_active=1").bind(form.id, form.tenant_id).all();
   for (const hook of hooks.results as any[]) {
-    try { fetch(hook.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event: 'response.created', form_id: form.id, response_id: id, data: b.data }) }).catch(()=>{}); } catch {}
+    try { fetch(hook.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ event: 'response.created', form_id: form.id, response_id: id, data: b.data }) }).catch((e: Error) => console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-forms', message: 'webhook delivery failed', error: e?.message, hookUrl: hook.url }))); } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-forms', message: 'webhook trigger failed', error: (e as Error)?.message })); }
   }
   return json({ id, score, thank_you: form.thank_you_message, redirect: form.redirect_url }, 201);
 });
